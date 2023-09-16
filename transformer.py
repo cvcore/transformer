@@ -1,5 +1,6 @@
 from turtle import forward
-from typing import Optional
+from typing import Dict, Optional
+from numpy import source
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -253,8 +254,10 @@ class DecoderBlock(nn.Module):
         self._w_v_1 = nn.Linear(in_features, in_features)
         self._w_q_1 = nn.Linear(in_features, in_features)
 
-    def forward(self, x: Tensor, enc_out: Tensor):
+    def forward(self, input: Dict):
         """Forward function of the decoder block. enc_out is expected from the encoder block."""
+
+        x, enc_out = input['x'], input['enc_out']
 
         x_0 = x
         q, k, v = self._w_q_0(x), self._w_k_0(x), self._w_v_0(x)
@@ -274,36 +277,80 @@ class DecoderBlock(nn.Module):
         x = self._layer_norm_2(x + x_2)
         del x_2
 
-        return x
+        return {'x': x, 'enc_out': enc_out}  # we keep the enc_out for the chained connection of decoder block
 
 
 class Transformer(nn.Module):
-    """Transformer accepts an input in the shape of (B, seq_len, )"""
+    """Transformer accepts an input in the shape of (B, seq_len, in_features)"""
 
     def __init__(
         self,
         in_features: int,
-        emb_features: int,
-        out_features: int,
+        embedding_dim: int,
         ff_hidden_features: int = 2048,
         n_encoder_blocks: int = 8,
         n_decoder_blocks: int = 8,
         n_attn_heads: int = 8,
     ):
         """Parameters:
-        in_features: number of channels after the input one-hot encoding.
+        in_features: number of channels after the input one-hot encoding, in our case it corresponds to the vocabulary size.
         emb_features: number of channels after the input & output embedding
-        out_features: number of channels for the output (target language) one-hot encoding"""
+        """
+        super().__init__()
 
-        self._input_emb = nn.Linear(in_features, emb_features)
-        self._output_emb = nn.Linear(out_features, emb_features)
-        self._encoder_blocks = nn.Sequential(*[EncoderBlock(emb_features, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
+        self._word_embedding = nn.Embedding(in_features, embedding_dim, padding_idx=1)  # padding_idx depends on which index we use in the encoder for padding.
+        self._encoder_blocks = nn.Sequential(*[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
+        self._decoder_blocks = nn.Sequential(*[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)])
+        self._pos_encoding = PositionalEncoding()
 
+    def forward(self, input: Dict):
+        """input is a dictionary containing the following keys:
+        'source': batched input containing tokenized source language sentences stored as one-hot encodings, shape (B, seq_len, in_features)
+        'target': (Optional) batched input containing tokenized target language sentences stored as one-hot encodings, shape (B, seq_len, in_features)
+            in the inference time, target should be None, since the model will use it's own output at time t to condition its prediction at time t+1
+        Note both source and target tensor have the same shape, because they share a joint vocabulary and also the embedding layer.
+        """
 
+        if self.training:
+            src, tgt = input['source'], input['target']
+            del input
 
-    def forward(self, x: Tensor):
-        pass
+            src = self._word_embedding(src)
+            tgt = self._word_embedding(tgt)
 
+            src = self._pos_encoding(src)
+            tgt = self._pos_encoding(tgt)
+
+            src_enc = self._encoder_blocks(src)
+            del src
+            tgt_dec = self._decoder_blocks({'x': tgt, 'enc_out': src_enc})['x']
+            del src_enc
+
+            tgt_dec = tgt_dec @ self._word_embedding.weight.T
+            tgt_dec = torch.softmax(tgt_dec, dim=-1)
+
+            return tgt_dec
+
+        else:
+            src = input['source']
+            tgt = torch.zeros_like(src)
+            del input
+            src = self._word_embedding(src)
+            src = self._pos_encoding(src)
+            src_enc = self._encoder_blocks(src)
+            del src
+
+            tgt[:, 0] = 0  # set the first token to be the start of sequence token
+            for i in range(1, tgt.shape[1]):
+                tgt_dec = self._word_embedding(tgt)
+                tgt_dec = self._pos_encoding(tgt_dec)
+                tgt_dec = self._decoder_blocks({'x': tgt_dec, 'enc_out': src_enc})['x']
+                tgt_dec = tgt_dec @ self._word_embedding.weight.T
+                tgt_dec = torch.softmax(tgt_dec, dim=-1)
+                next_tokens = tgt_dec[:, i, :].argmax(dim=-1)  # shape: (B,)
+                tgt[:, i] = next_tokens
+
+            return tgt_dec
 
 
 def test_attention():
@@ -375,6 +422,26 @@ def test_dec_block():
     print(dec_out[0])
 
 
+def test_transformer():
+    B, T, L = 2, 3, 4
+    x = torch.ones((B, T)).long()
+    y = torch.ones((B, T)).long()
+    transformer = Transformer(
+        in_features=L,
+        embedding_dim=4,
+        ff_hidden_features=8,
+        n_encoder_blocks=2,
+        n_decoder_blocks=2,
+        n_attn_heads=2,
+    )
+    transformer.train()
+    out = transformer({'source': x, 'target': y})
+    print(out.shape)
+    print(out[0])
+    transformer.eval()
+    out = transformer({'source': x})
+    print(out.shape)
+    print(out[0])
 
 
 if __name__ == "__main__":
@@ -383,4 +450,4 @@ if __name__ == "__main__":
     # test_layernorm()
     # test_enc_block()
     # test_multihead_attn_pure()
-    test_dec_block()
+    test_transformer()
