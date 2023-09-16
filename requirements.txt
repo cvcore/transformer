@@ -1,0 +1,7 @@
+torch
+datasets
+torchdata
+torchtext
+pylint
+portalocker
+ipywidgets
