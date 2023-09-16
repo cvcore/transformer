@@ -4,12 +4,14 @@ from pathlib import Path
 import pickle
 import timeit
 import token
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 from unittest import result
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
+from trie import Trie
+NoneType = type(None)
 
 
 def merge_dictionary(*dictionaries):
@@ -102,26 +104,30 @@ class BytePairEncoder():
         else:
             raise ValueError(f"Language {language} not supported. Must be either 'english' or 'german' or 'universal'.")
 
-        self._vocabulary = vocabulary
-        self._max_alphabet_len = max([len(token) for token in self._vocabulary])
+        # self._vocabulary = vocabulary
+        self._trie = Trie()
+        for token in vocabulary:
+            self._trie.insert(token)
 
     def add_to_vocabulary(self, token: str) -> None:
-        if token in self._vocabulary:
+        if token in self._trie:
             print("Alphabet already in vocabulary.")
             return
-        self._vocabulary.append(token)
+        self._trie.insert(token)
         # self.reset_cache()
-        self._max_alphabet_len = max(self._max_alphabet_len, len(token))
+        # self._max_alphabet_len = max(self._max_alphabet_len, len(token))
 
     @lru_cache()
     def get_token_id(self, token: str) -> int:
-        if token not in self._vocabulary:
+        if token is None or token not in self._trie:
             return self.get_token_id(self.UNKNOWN_TOKEN)
-        return self._vocabulary.index(token)
+        return self._trie.get_id(token)
 
     @lru_cache()
-    def get_token_from_id(self, id: int) -> str:
-        return self._vocabulary[id]
+    def get_token_from_id(self, id: Union[NoneType, int]) -> str:
+        if id is None or id < 0 or id >= len(self._trie):
+            return self.UNKNOWN_TOKEN
+        return self._trie.get_token(id)
 
     def reset_cache(self):
         self.get_token_id.cache_clear()
@@ -147,19 +153,10 @@ class BytePairEncoder():
 
         idx = 0
         while idx < len(sentence) and (max_token_len is None or len(result) < max_token_len):
-            longest_alphabet = None
-
-            for alphabet_len in range(min(self._max_alphabet_len, len(sentence) - idx), 0, -1):  # here we start with the longest possible token first.
-                alphabet = sentence[idx:idx + alphabet_len]
-                if alphabet in self._vocabulary:
-                    longest_alphabet = alphabet
-                    longest_alphabet_len = alphabet_len
-                    break
-                # else:
-                #     break
-
-            result.append(self.get_token_id(longest_alphabet))
-            idx += longest_alphabet_len
+            longest_token_id = self._trie.longest_match(sentence, idx)
+            longest_token_len = len(self.get_token_from_id(longest_token_id))
+            result.append(longest_token_id)
+            idx += longest_token_len
 
         if use_padding_token:
             assert max_token_len is not None, "max_n_tokens must be specified when using padding."
@@ -200,16 +197,16 @@ class BytePairEncoder():
         return token_pairs
 
     def learn_vocabulary_from_corpus(self, corpus: List[str], n_processes: int = 1):
-        progress = tqdm(total=self._max_vocab_size - len(self._vocabulary))
+        progress = tqdm(total=self._max_vocab_size - len(self._trie))
 
-        while len(self._vocabulary) < self._max_vocab_size:
+        while len(self._trie) < self._max_vocab_size:
             self._token_pairs = defaultdict(int)
 
             if n_processes > 1:
                 chunk_size = int(ceil(len(corpus) / n_processes))
                 chunk_indices = [(i * chunk_size, min((i + 1) * chunk_size, len(corpus))) for i in range(n_processes)]
                 with Pool(n_processes) as pool:
-                    results = pool.starmap(self._count_pairs_parallel, [(corpus, start_idx, end_idx) for start_idx, end_idx in chunk_indices])
+                    results = pool.starmap(self._count_pairs_parallel, [(corpus, start_idx, end_idx) for (start_idx, end_idx) in chunk_indices])
                 for result in results:
                     for key, value in result.items():
                         self._token_pairs[key] += value
@@ -234,9 +231,8 @@ class BytePairEncoder():
     def save_vocabulary(self, path: str):
         vocabulary_data = {
             'language': self._language,
-            'vocabulary': self._vocabulary,
+            'trie': self._trie,
             'max_vocab_size': self._max_vocab_size,
-            'max_alphabet_len': self._max_alphabet_len,
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Saving vocabulary data to: {path}")
@@ -263,8 +259,8 @@ if __name__ == "__main__":
         print(f"Time: {time}s for learning vocabulary from {len(test_text_corpus)} sentences.")
 
     encoder_without_signals = BytePairEncoder('universal', max_vocab_size=300, use_start_token=False, use_end_token=False, use_padding_token=False, max_token_len=30, load_vocabulary_from='data/vocabulary.pkl')
-    print(f"Final vocabulary size: {len(encoder._vocabulary)}")
-    print(f"Final vocabulary: {encoder._vocabulary}")
+    print(f"Final vocabulary size: {len(encoder._trie)}")
+    print(f"Final vocabulary: {encoder._trie._tokens}")
     print(f"\"I am a Transformer.\" => {encoder.encode_sentence('I am a Transformer.')}")
     print(f"\"Deutschland ÄÖÜ\" => {encoder.encode_sentence('Deutschland ÄÖÜ')}")
     print(f"\"This is a lonnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnng string.......\" => {encoder.encode_sentence('This is a lonnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnng string.......')}")
