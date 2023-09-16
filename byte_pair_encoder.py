@@ -34,6 +34,7 @@ class BytePairEncoder():
     END_TOKEN = '𝄇'
     PADDING_TOKEN = '♪'
     UNKNOWN_TOKEN = '☐'
+    RESERVED = '♫'
 
     # Signal tokens are used to mark the beginning and end of a sentence and won't appear inside a normal sentence.
     # And we don't allow them to form a byte-pair.
@@ -65,7 +66,7 @@ class BytePairEncoder():
 
     def init_vocabulary(self, language: str):
         EN_VOCABULARY = [
-            self.START_TOKEN, self.PADDING_TOKEN, self.END_TOKEN, self.UNKNOWN_TOKEN,
+            self.RESERVED, self.START_TOKEN, self.PADDING_TOKEN, self.END_TOKEN, self.UNKNOWN_TOKEN,
             ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/',
             '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
             ':', '<', '=', '>', '?', '@',
@@ -80,7 +81,7 @@ class BytePairEncoder():
         ]
 
         DE_VOCABULARY = [
-            self.START_TOKEN, self.PADDING_TOKEN, self.END_TOKEN, self.UNKNOWN_TOKEN,
+            self.RESERVED, self.START_TOKEN, self.PADDING_TOKEN, self.END_TOKEN, self.UNKNOWN_TOKEN,
             ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/',
             '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
             ':', '<', '=', '>', '?', '@',
@@ -154,7 +155,11 @@ class BytePairEncoder():
         idx = 0
         while idx < len(sentence) and (max_token_len is None or len(result) < max_token_len):
             longest_token_id = self._trie.longest_match(sentence, idx)
-            longest_token_len = len(self.get_token_from_id(longest_token_id))
+            if longest_token_id is None:
+                longest_token_id = self.get_token_id(self.UNKNOWN_TOKEN)
+                longest_token_len = 1
+            else:
+                longest_token_len = len(self.get_token_from_id(longest_token_id))
             result.append(longest_token_id)
             idx += longest_token_len
 
@@ -177,7 +182,7 @@ class BytePairEncoder():
         )
 
     def encode_corpus(self, corpus: List[str]) -> np.ndarray:
-        return np.array([self.encode_sentence(sentence) for sentence in corpus])
+        return np.array([self.encode_sentence(sentence) for sentence in corpus]).astype(int)
 
     def decode_corpus(self, tokens: np.ndarray) -> List[str]:
         return [self.decode_sentence(sentence) for sentence in tokens]
