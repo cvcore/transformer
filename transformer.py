@@ -303,6 +303,7 @@ class Transformer(nn.Module):
         super().__init__()
 
         self._embedding_padding_idx = embedding_padding_idx
+        self._embedding_dim = embedding_dim
         self._word_embedding = nn.Embedding(dictionary_len, embedding_dim, embedding_padding_idx)  # padding_idx depends on which index we use in the encoder for padding.
         self._encoder_blocks = nn.Sequential(*[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
         self._decoder_blocks = nn.Sequential(*[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)])
@@ -326,8 +327,9 @@ class Transformer(nn.Module):
             # and pad the first token with 0, which is the start of sequence token
             tgt = torch.cat([torch.zeros_like(tgt[:, 0:1]), tgt[:, :-1]], dim=-1)
 
-            src = self._word_embedding(src)
-            tgt = self._word_embedding(tgt)
+            rescale_factor = torch.sqrt(torch.tensor(self._embedding_dim).to(src))  # make it larger: we don't want the pe later to be louder than the words
+            src = self._word_embedding(src) * rescale_factor
+            tgt = self._word_embedding(tgt) * rescale_factor
 
             src = self._pos_encoding(src)
             tgt = self._pos_encoding(tgt)
