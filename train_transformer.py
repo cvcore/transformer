@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 from dataclasses import asdict, dataclass
+from optimizer import Scheduler
 
 
 
@@ -18,6 +19,8 @@ class TrainingConfig:
     detailed_log_freq: int = 100
     training_bs: int = 96
     learning_rate: float = 0.0001
+    use_scheduler: bool = True
+    cross_entropy_label_smoothing: float = 0.1
     bpe_language: str = 'universal'
     bpe_vocab_size: int = 1000
     bpe_max_token_len: int = 300
@@ -32,6 +35,7 @@ class TrainingConfig:
     model_decoder_blocks: int = 4
     model_attn_heads: int = 8
     clip_gradient_norm_to: Optional[float] = None
+    load_checkpoint: Optional[str] = None
 
 CONFIGS = TrainingConfig()
 
@@ -75,12 +79,14 @@ def make_model(load_from: Optional[str] = None):
         n_attn_heads=CONFIGS.model_attn_heads,
     )
     weight = torch.ones(1000)
-    weight[0] = 0
-    weight[2] = 0
-    weight[4] = 0
+    weight[0] = 0  # RESERVED
+    weight[2] = 0  # PADDING
+    weight[4] = 0  # UNKNOWN
     weight = weight.cuda()
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=CONFIGS.model_embedding_padding_idx, weight=weight)
-    optimizer = torch.optim.Adam(transformer.parameters(), lr=CONFIGS.learning_rate)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=CONFIGS.model_embedding_padding_idx, weight=weight, label_smoothing=CONFIGS.cross_entropy_label_smoothing)
+    optimizer = torch.optim.Adam(transformer.parameters(), lr=CONFIGS.learning_rate, betas=(0.9, 0.98), eps=1e-9)
+    scheduler = Scheduler(optimizer, CONFIGS.model_embedding_dim, 4000) if CONFIGS.use_scheduler else None
+
     start_epoch = 0
 
     if load_from is not None and Path(load_from).exists():
@@ -92,7 +98,7 @@ def make_model(load_from: Optional[str] = None):
     if torch.cuda.is_available():
         transformer = transformer.cuda()
 
-    return transformer, criterion, optimizer, start_epoch
+    return transformer, criterion, optimizer, scheduler, start_epoch
 
 
 def init_wandb():
@@ -106,7 +112,7 @@ def run_training():
     init_wandb()
     train, val, _ = make_dataloader()
     text_encoder = make_text_encoder()
-    transformer, criterion, optimizer, start_epoch = make_model()
+    transformer, criterion, optimizer, scheduler, start_epoch = make_model(CONFIGS.load_checkpoint)
     wandb.watch(transformer, log_freq=CONFIGS.detailed_log_freq)
 
     for epoch in range(start_epoch, CONFIGS.n_epochs_training):
@@ -140,10 +146,15 @@ def run_training():
             tgt = tgt.view(-1)
             loss = criterion(output, tgt)
             loss.backward()
-            wandb.log({"loss": loss.item()}, commit=True)
             if CONFIGS.clip_gradient_norm_to is not None:
                 torch.nn.utils.clip_grad_norm_(transformer.parameters(), CONFIGS.clip_gradient_norm_to)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+                current_lr = scheduler.get_lr()[0]
+            else:
+                current_lr = CONFIGS.learning_rate
+            wandb.log({"loss": loss.item(), "learning_rate": current_lr}, commit=True)
             epoch_loss += loss.item()
         epoch_loss /= batch_idx
         print(f"Epoch: {epoch + 1} | Train loss: {epoch_loss:.3f}")
@@ -159,28 +170,21 @@ def run_training():
             f"data/transformer_epoch_{epoch}.pth",
         )
 
+        # # validation
         # transformer.eval()
         # epoch_loss = 0
         # for batch_idx, batch in tqdm(enumerate(val)):
-
         #     src, tgt = batch
         #     src = torch.from_numpy(text_encoder.encode_corpus(list(src)))
         #     tgt = torch.from_numpy(text_encoder.encode_corpus(list(tgt)))
         #     src = src.cuda()
         #     tgt = tgt.cuda()
-        #     output = transformer({"source": src})
-        #     if batch_idx % N_BATCH_INSPECTION == 0:
-        #         output_tokens = torch.argmax(output, dim=-1)
-        #         output_tokens = output_tokens.cpu().numpy()
-        #         tgt_tokens = tgt.cpu().numpy()
-        #         src_tokens = src.cpu().numpy()
-        #         print("Input:", text_encoder.decode_corpus(src_tokens))
-        #         print("Output:", text_encoder.decode_corpus(output_tokens))
-        #         print("Target:", text_encoder.decode_corpus(tgt_tokens))
+        #     output = transformer({ "source": src})
         #     output = output.view(-1, output.shape[-1])
         #     tgt = tgt.view(-1)
         #     loss = criterion(output, tgt)
         #     epoch_loss += loss.item()
+        #     wandb.log({"val_loss": loss.item()}, commit=True)
         # epoch_loss /= batch_idx
         # print(f"Epoch: {epoch + 1} | Val loss: {epoch_loss:.3f}")
 
