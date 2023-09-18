@@ -303,14 +303,10 @@ class Transformer(nn.Module):
         self._embedding_padding_idx = embedding_padding_idx
         self._embedding_dim = embedding_dim
         self._word_embedding = nn.Embedding(dictionary_len, embedding_dim, embedding_padding_idx)  # padding_idx depends on which index we use in the encoder for padding.
-        self._encoder_blocks = nn.Sequential(
-            *[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)],
-            LayerNorm(embedding_dim)
-        )
-        self._decoder_blocks = nn.Sequential(
-            *[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)],
-            LayerNorm(embedding_dim),
-        )
+        self._encoder_blocks = nn.Sequential(*[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
+        self._layer_norm_0 = LayerNorm(embedding_dim)
+        self._decoder_blocks = nn.Sequential(*[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)])
+        self._layer_norm_1 = LayerNorm(embedding_dim)
         self._pos_encoding = PositionalEncoding()
 
     def forward(self, input: Dict):
@@ -338,9 +334,9 @@ class Transformer(nn.Module):
             src = self._pos_encoding(src)
             tgt = self._pos_encoding(tgt)
 
-            src_enc = self._encoder_blocks(src)
+            src_enc = self._layer_norm_0(self._encoder_blocks(src))
             del src
-            tgt_dec = self._decoder_blocks({'x': tgt, 'enc_out': src_enc})['x']
+            tgt_dec = self._layer_norm_1(self._decoder_blocks({'x': tgt, 'enc_out': src_enc})['x'])
             del src_enc
 
             tgt_dec = tgt_dec @ self._word_embedding.weight.T
