@@ -1,3 +1,4 @@
+import math
 from turtle import forward
 from typing import Dict, Optional
 from numpy import source
@@ -133,16 +134,6 @@ class MultiHeadAttentionPure(nn.Module):
         self._n_heads = n_heads
         self._in_features = in_features
 
-        # x -> q, k, v
-        # self.w_q = nn.Linear(in_features, in_features)
-        # self.w_k = nn.Linear(in_features, in_features)
-        # self.w_v = nn.Linear(in_features, in_features)
-
-        # multi-head attention
-        self.v_q = nn.Linear(in_features, in_features)
-        self.v_k = nn.Linear(in_features, in_features)
-        self.v_v = nn.Linear(in_features, in_features)
-
         # final linear mapping
         self.linear_out = nn.Linear(in_features, in_features)
 
@@ -224,13 +215,17 @@ class EncoderBlock(nn.Module):
 
     def forward(self, x: Tensor):
         x_0 = x
+        x = self._layer_norm_0(x)
         k, q, v = self._w_k(x), self._w_q(x), self._w_v(x)
         x = self._mh_attn(k, q, v, apply_mask=False)
-        x = self._layer_norm_0(x + x_0)
+        x += x_0
         del x_0
+
         x_1 = x
+        x = self._layer_norm_1(x)
         x = self._feed_forward(x)
-        x = self._layer_norm_1(x + x_1)
+        x += x_1
+        del x_1
 
         return x
 
@@ -260,21 +255,24 @@ class DecoderBlock(nn.Module):
         x, enc_out = input['x'], input['enc_out']
 
         x_0 = x
+        x = self._layer_norm_0(x)
         q, k, v = self._w_q_0(x), self._w_k_0(x), self._w_v_0(x)
         x = self._mh_attn_0(q, k, v, apply_mask=True)
-        x = self._layer_norm_0(x + x_0)
+        x += x_0
         del x_0
 
         x_1 = x
+        x = self._layer_norm_1(x)
         v, k = self._w_v_1(enc_out), self._w_k_1(enc_out)
         q = self._w_q_1(x)
         x = self._mh_attn_1(q, k, v, apply_mask=False)
-        x = self._layer_norm_1(x + x_1)
+        x += x_1
         del x_1
 
         x_2 = x
+        x = self._layer_norm_2(x)
         x = self._feed_forward(x)
-        x = self._layer_norm_2(x + x_2)
+        x += x_2
         del x_2
 
         return {'x': x, 'enc_out': enc_out}  # we keep the enc_out for the chained connection of decoder block
@@ -305,8 +303,14 @@ class Transformer(nn.Module):
         self._embedding_padding_idx = embedding_padding_idx
         self._embedding_dim = embedding_dim
         self._word_embedding = nn.Embedding(dictionary_len, embedding_dim, embedding_padding_idx)  # padding_idx depends on which index we use in the encoder for padding.
-        self._encoder_blocks = nn.Sequential(*[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
-        self._decoder_blocks = nn.Sequential(*[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)])
+        self._encoder_blocks = nn.Sequential(
+            *[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)],
+            LayerNorm(embedding_dim)
+        )
+        self._decoder_blocks = nn.Sequential(
+            *[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)],
+            LayerNorm(embedding_dim),
+        )
         self._pos_encoding = PositionalEncoding()
 
     def forward(self, input: Dict):
@@ -327,7 +331,7 @@ class Transformer(nn.Module):
             # and pad the first token with 0, which is the start of sequence token
             tgt = torch.cat([torch.zeros_like(tgt[:, 0:1]), tgt[:, :-1]], dim=-1)
 
-            rescale_factor = torch.sqrt(torch.tensor(self._embedding_dim).to(src))  # make it larger: we don't want the pe later to be louder than the words
+            rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
             src = self._word_embedding(src) * rescale_factor
             tgt = self._word_embedding(tgt) * rescale_factor
 
