@@ -1,6 +1,6 @@
 import math
 from turtle import forward
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from numpy import source
 import torch
 import torch.nn as nn
@@ -14,12 +14,12 @@ as input we have x in shape (batch_size, )
 
 def scaled_dp_attention(q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
     """Scaled dot-product attention.
-    If mask is given, the tensor elements with a positive mask will be kept, and others filled with -inf before the softmax function."""
+    If mask is given, the tensor elements with a mask value of True will be kept, and others filled with -inf before the softmax function."""
 
     d_k = torch.tensor(q.size(-1))
     scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(d_k)
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
+        scores = scores.masked_fill(~mask, -1e9)
     attention = torch.softmax(scores, dim=-1)
     return torch.matmul(attention, v), attention
 
@@ -74,55 +74,6 @@ class LayerNorm(nn.Module):
         return x
 
 
-class MultiHeadAttention(nn.Module):
-    """For an input tensor (B x seq_len x in_features), output a tensor with same dimension.
-    n_heads is the number of heads for the multi-head attention module."""
-
-    def __init__(self, in_features: int, n_heads: int):
-        super().__init__()
-
-        assert in_features % n_heads == 0, f"the in_features = {in_features} is not divisible by n_heads = {n_heads}"
-        self._n_heads = n_heads
-        self._in_features = in_features
-
-        # x -> q, k, v
-        self.w_q = nn.Linear(in_features, in_features)
-        self.w_k = nn.Linear(in_features, in_features)
-        self.w_v = nn.Linear(in_features, in_features)
-
-        # multi-head attention
-        self.v_q = nn.Linear(in_features, in_features)
-        self.v_k = nn.Linear(in_features, in_features)
-        self.v_v = nn.Linear(in_features, in_features)
-
-        # final linear mapping
-        self.linear_out = nn.Linear(in_features, in_features)
-
-
-    def forward(self, x: Tensor, apply_mask: bool = False):
-        len_b, len_seq, len_features = x.shape[-3:]
-        assert len_features == self._in_features
-
-        q = self.v_q(self.w_q(x))
-        k = self.v_k(self.w_k(x))
-        v = self.v_v(self.w_v(x))
-
-        q = torch.split(q, self._n_heads, dim=-1)  # list of B x seq x (in_features / h)
-        k = torch.split(k, self._n_heads, dim=-1)
-        v = torch.split(v, self._n_heads, dim=-1)
-
-        q = torch.concat(q, dim=0)  # concatenate the multi-head dimensions into the batch dimension.
-        k = torch.concat(k, dim=0)
-        v = torch.concat(v, dim=0)
-
-        x, attn = scaled_dp_attention(q, k, v, None)  # (h x B) x seq x (in_features / h)
-        x = x.view(self._n_heads, len_b, len_seq, len_features // self._n_heads)
-        x = x.unsqueeze(-2).swapaxes(0, -2).reshape(len_b, len_seq, len_features).squeeze(0)  # B x seq x in_features
-
-        x = self.linear_out(x)
-        return x
-
-
 class MultiHeadAttentionPure(nn.Module):
     """For an input tensor (B x seq_len x in_features), output a tensor with same dimension.
     n_heads is the number of heads for the multi-head attention module."""
@@ -138,7 +89,7 @@ class MultiHeadAttentionPure(nn.Module):
         self.linear_out = nn.Linear(in_features, in_features)
 
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, apply_mask: bool = False):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
         assert q.shape == k.shape
         assert q.shape[:-1] == v.shape[:-1]
         len_b, len_seq, len_features = q.shape[-3:]
@@ -155,11 +106,8 @@ class MultiHeadAttentionPure(nn.Module):
         q = torch.concat(q, dim=0)  # concatenate the multi-head dimensions into the batch dimension.
         k = torch.concat(k, dim=0)
         v = torch.concat(v, dim=0)
-
-        if apply_mask is True:
-            mask = torch.tril(torch.ones((len_seq, len_seq)).to(q))
-        else:
-            mask = None
+        if mask is not None:
+            mask = torch.concat([mask] * self._n_heads, dim=0)
 
         x, attn = scaled_dp_attention(q, k, v, mask)  # (h x B) x seq x (in_features / h)
         x = x.view(self._n_heads, len_b, len_seq, len_features // self._n_heads)
@@ -213,11 +161,13 @@ class EncoderBlock(nn.Module):
         self._feed_forward = FeedForward(in_features, hidden_features, in_features)
         self._layer_norm_1 = LayerNorm(in_features)
 
-    def forward(self, x: Tensor):
+    def forward(self, input: Dict):
+        x = input["x"]
+        mask = input.get("mask", None)
         x_0 = x
         x = self._layer_norm_0(x)
         k, q, v = self._w_k(x), self._w_q(x), self._w_v(x)
-        x = self._mh_attn(k, q, v, apply_mask=False)
+        x = self._mh_attn(k, q, v, mask=mask)
         x += x_0
         del x_0
 
@@ -227,7 +177,7 @@ class EncoderBlock(nn.Module):
         x += x_1
         del x_1
 
-        return x
+        return {"x": x, "mask": mask}
 
 
 class DecoderBlock(nn.Module):
@@ -253,11 +203,12 @@ class DecoderBlock(nn.Module):
         """Forward function of the decoder block. enc_out is expected from the encoder block."""
 
         x, enc_out = input['x'], input['enc_out']
+        mask_tgt, mask_tgt_src = input['mask_tgt'], input['mask_tgt_src']
 
         x_0 = x
         x = self._layer_norm_0(x)
         q, k, v = self._w_q_0(x), self._w_k_0(x), self._w_v_0(x)
-        x = self._mh_attn_0(q, k, v, apply_mask=True)
+        x = self._mh_attn_0(q, k, v, mask=mask_tgt)  # mask_tgt is supposed to include the sequence length mask and the causal mask
         x += x_0
         del x_0
 
@@ -265,7 +216,7 @@ class DecoderBlock(nn.Module):
         x = self._layer_norm_1(x)
         v, k = self._w_v_1(enc_out), self._w_k_1(enc_out)
         q = self._w_q_1(x)
-        x = self._mh_attn_1(q, k, v, apply_mask=False)
+        x = self._mh_attn_1(q, k, v, mask=mask_tgt_src)  # mask_tgt_src is supposed to include the sequence length mask calculated from the src and tgt sequence jointly.
         x += x_1
         del x_1
 
@@ -275,7 +226,17 @@ class DecoderBlock(nn.Module):
         x += x_2
         del x_2
 
-        return {'x': x, 'enc_out': enc_out}  # we keep the enc_out for the chained connection of decoder block
+        return {'x': x, 'enc_out': enc_out, 'mask_tgt': mask_tgt, 'mask_tgt_src': mask_tgt_src}  # we keep the enc_out for the chained connection of decoder block
+
+
+def get_mask_from_token(token: Tensor, padding_ids: List[int]):
+    assert token.dtype == torch.long
+    assert len(token.shape) == 2
+    len_batch, len_seq = token.shape
+    mask = torch.ones((len_batch, len_seq), dtype=torch.bool).to(token.device)
+    for p_id in padding_ids:
+        mask &= (token != p_id)
+    return mask
 
 
 class Transformer(nn.Module):
@@ -309,10 +270,43 @@ class Transformer(nn.Module):
         self._layer_norm_1 = LayerNorm(embedding_dim)
         self._pos_encoding = PositionalEncoding()
 
+    def _get_masks(self, mask_type: str, src_tokens: Optional[Tensor] = None, tgt_tokens: Optional[Tensor] = None):
+        """Calculate the mask to be feeded into the self attention calculation.
+        'mask_type': type of mask
+        'src_tokens': tensor of shape (B, seq_token),
+        'tgt_tokens": tensor of shape (B, tgt_token),
+        Returns:
+            mask: shape (B, seq_len, seq_len) that can be applied to the attention module.
+        """
+        ignore_token_ids = [self._embedding_padding_idx]
+        if mask_type == "src_mask":
+            assert src_tokens is not None and tgt_tokens is None
+            mask = get_mask_from_token(src_tokens, ignore_token_ids)
+            mask_v = mask[:, None, :]  # B, 1, seq_len
+            mask_h = mask[:, :, None]  # B, seq_len, 1
+            mask = mask_v * mask_h  # B, seq_len, seq_len
+        elif mask_type == "tgt_src_mask":
+            assert tgt_tokens is not None and src_tokens is not None
+            mask_tgt = get_mask_from_token(tgt_tokens, ignore_token_ids)[:, :, None]  # B, len_tgt, 1
+            mask_src = get_mask_from_token(src_tokens, ignore_token_ids)[:, None, :]  # B, 1, len_src
+            mask = mask_tgt * mask_src
+        elif mask_type == "tgt_mask":
+            assert tgt_tokens is not None and src_tokens is None
+            mask = get_mask_from_token(tgt_tokens, ignore_token_ids)
+            mask_v = mask[:, None, :]  # B, 1, seq_len
+            mask_h = mask[:, :, None]  # B, seq_len, 1
+            mask = mask_v * mask_h  # B, seq_len, seq_len
+            mask &= torch.tril(mask)
+        else:
+            raise ValueError(f"Invalid mask_type={mask_type} given!")
+
+        return mask
+
+
     def forward(self, input: Dict):
         """input is a dictionary containing the following keys:
-        'source': batched input containing tokenized source language sentences stored as one-hot encodings, shape (B, seq_len)
-        'target': (Optional) batched input containing tokenized target language sentences stored as one-hot encodings, shape (B, seq_len)
+        'source': batched input containing tokenized source language sentences stored as padded list of integers, shape (B, seq_len)
+        'target': (Optional) batched input containing tokenized target language sentences stored as padded list of integers, shape (B, seq_len)
             in the inference time, target should be None, since the model will use it's own output at time t to condition its prediction at time t+1
         Note both source and target tensor have the same shape, because they share a joint vocabulary and also the embedding layer.
 
@@ -327,6 +321,10 @@ class Transformer(nn.Module):
             # and pad the first token with 0, which is the start of sequence token
             tgt = torch.cat([torch.zeros_like(tgt[:, 0:1]), tgt[:, :-1]], dim=-1)
 
+            mask_src = self._get_masks("src_mask", src_tokens=src)
+            mask_tgt = self._get_masks("tgt_mask", tgt_tokens=tgt)
+            mask_tgt_src = self._get_masks("tgt_src_mask", src_tokens=src, tgt_tokens=tgt)
+
             rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
             src = self._word_embedding(src) * rescale_factor
             tgt = self._word_embedding(tgt) * rescale_factor
@@ -334,9 +332,9 @@ class Transformer(nn.Module):
             src = self._pos_encoding(src)
             tgt = self._pos_encoding(tgt)
 
-            src_enc = self._layer_norm_0(self._encoder_blocks(src))
+            src_enc = self._layer_norm_0(self._encoder_blocks({'x': src, 'mask': mask_src})['x'])
             del src
-            tgt_dec = self._layer_norm_1(self._decoder_blocks({'x': tgt, 'enc_out': src_enc})['x'])
+            tgt_dec = self._layer_norm_1(self._decoder_blocks({'x': tgt, 'enc_out': src_enc, 'mask_tgt': mask_tgt, 'mask_tgt_src': mask_tgt_src})['x'])
             del src_enc
 
             tgt_dec = tgt_dec @ self._word_embedding.weight.T
@@ -348,16 +346,22 @@ class Transformer(nn.Module):
             src = input['source']
             tgt = torch.zeros_like(src)
             del input
+
+            src_tokens = src
+            mask_src = self._get_masks("src_mask", src_tokens=src)
+
             src = self._word_embedding(src)
             src = self._pos_encoding(src)
-            src_enc = self._encoder_blocks(src)
+            src_enc = self._layer_norm_0(self._encoder_blocks({'x': src, 'mask': mask_src})['x'])
             del src
 
             tgt[:, 0] = self._embedding_padding_idx
             for i in range(tgt.shape[1]):
+                mask_tgt = self._get_masks("tgt_mask", tgt_tokens=tgt)
+                mask_tgt_src = self._get_masks("tgt_src_mask", src_tokens=src_tokens, tgt_tokens=tgt)
                 tgt_dec = self._word_embedding(tgt)
                 tgt_dec = self._pos_encoding(tgt_dec)
-                tgt_dec = self._decoder_blocks({'x': tgt_dec, 'enc_out': src_enc})['x']
+                tgt_dec = self._layer_norm_1(self._decoder_blocks({'x': tgt_dec, 'enc_out': src_enc, 'mask_tgt': mask_tgt, 'mask_tgt_src': mask_tgt_src})['x'])
                 tgt_dec = tgt_dec @ self._word_embedding.weight.T
                 # tgt_dec = torch.softmax(tgt_dec, dim=-1)
                 next_tokens = tgt_dec[:, i, :].argmax(dim=-1)  # shape: (B,)
@@ -456,6 +460,15 @@ def test_transformer():
     out = transformer({'source': x})
     print(out.shape)
     print(out[0])
+
+
+def test_get_mask_from_token():
+    B, T = 2, 4
+    x = torch.randint(0, 4, (B, T))
+    mask = get_mask_from_token(x, [0, 1])
+    print(x)
+    print(mask)
+    print(~mask)
 
 
 if __name__ == "__main__":
