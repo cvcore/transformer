@@ -333,7 +333,7 @@ class TorchTransformer(nn.Module):
             tgt = torch.cat([torch.zeros_like(tgt[:, 0:1]), tgt[:, :-1]], dim=-1)
 
             # mask_src = self._get_masks("src_mask", src_tokens=src)
-            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1])), diagonal=1).to(tgt)
+            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1]), dtype=torch.bool), diagonal=1).to(device=tgt.device)
             # mask_tgt_src = self._get_masks("tgt_src_mask", src_tokens=src, tgt_tokens=tgt)
 
             rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
@@ -353,7 +353,7 @@ class TorchTransformer(nn.Module):
         else:
             src = input['source']
             tgt = torch.zeros_like(src)
-            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1])), diagonal=1).to(tgt)
+            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1]), dtype=torch.bool), diagonal=1).to(device=tgt.device)
             del input
 
             rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
