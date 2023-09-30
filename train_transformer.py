@@ -3,9 +3,10 @@ from pyexpat import model
 from typing import Optional
 from torchtext.datasets import multi30k, Multi30k
 from byte_pair_encoder import BytePairEncoder
-from transformer import Transformer
+from transformer import TorchTransformer, Transformer
 import torch
 from torch.utils.data import DataLoader
+import torch.nn as nn
 from tqdm import tqdm
 import wandb
 from dataclasses import asdict, dataclass
@@ -29,13 +30,14 @@ class TrainingConfig:
     bpe_use_padding_token: bool = True
     bpe_load_vocabulary_from: str = "data/universal_bpe_encoder.pkl"
     model_embedding_dim: int = 64
-    model_embedding_padding_idx: int = 0
+    model_embedding_padding_idx: int = 2
     model_ff_hidden_features: int = 256
     model_encoder_blocks: int = 4
     model_decoder_blocks: int = 4
     model_attn_heads: int = 8
     clip_gradient_norm_to: Optional[float] = None
     load_checkpoint: Optional[str] = None
+    use_pytorch_model: bool = True
 
 CONFIGS = TrainingConfig()
 
@@ -69,15 +71,19 @@ def make_text_encoder():
 
 
 def make_model(load_from: Optional[str] = None):
-    transformer = Transformer(
-        dictionary_len=CONFIGS.bpe_vocab_size,
-        embedding_dim=CONFIGS.model_embedding_dim,
-        embedding_padding_idx=CONFIGS.model_embedding_padding_idx,
-        ff_hidden_features=CONFIGS.model_ff_hidden_features,
-        n_encoder_blocks=CONFIGS.model_encoder_blocks,
-        n_decoder_blocks=CONFIGS.model_decoder_blocks,
-        n_attn_heads=CONFIGS.model_attn_heads,
-    )
+    kwargs = {
+        "dictionary_len": CONFIGS.bpe_vocab_size,
+        "embedding_dim": CONFIGS.model_embedding_dim,
+        "embedding_padding_idx": CONFIGS.model_embedding_padding_idx,
+        "ff_hidden_features": CONFIGS.model_ff_hidden_features,
+        "n_encoder_blocks": CONFIGS.model_encoder_blocks,
+        "n_decoder_blocks": CONFIGS.model_decoder_blocks,
+        "n_attn_heads": CONFIGS.model_attn_heads,
+    }
+    if CONFIGS.use_pytorch_model:
+        transformer = TorchTransformer(**kwargs)
+    else:
+        transformer = Transformer(**kwargs)
     weight = torch.ones(1000)
     weight[0] = 0  # RESERVED
     weight[2] = 0  # PADDING

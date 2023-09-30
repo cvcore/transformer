@@ -239,6 +239,142 @@ def get_mask_from_token(token: Tensor, padding_ids: List[int]):
     return mask
 
 
+class TorchTransformer(nn.Module):
+
+    def __init__(
+        self,
+        dictionary_len: int,
+        embedding_dim: int,
+        embedding_padding_idx: int = 0,
+        ff_hidden_features: int = 2048,
+        n_encoder_blocks: int = 8,
+        n_decoder_blocks: int = 8,
+        n_attn_heads: int = 8,
+    ):
+        """Parameters:
+        dictionary_len: the length of the dictionary, i.e. the number of tokens in the vocabulary
+        embedding_dim: number of channels after the input & output embedding
+        ff_hidden_features: the number of hidden features in the feed-forward layer
+        n_encoder_blocks: number of encoder blocks
+        n_decoder_blocks: number of decoder blocks
+        n_attn_heads: number of attention heads
+        """
+        super().__init__()
+
+        self._embedding_padding_idx = embedding_padding_idx
+        self._embedding_dim = embedding_dim
+        self._word_embedding = nn.Embedding(dictionary_len, embedding_dim, embedding_padding_idx)  # padding_idx depends on which index we use in the encoder for padding.
+        # self._encoder_blocks = nn.Sequential(*[EncoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_encoder_blocks)])
+        # self._layer_norm_0 = LayerNorm(embedding_dim)
+        # self._decoder_blocks = nn.Sequential(*[DecoderBlock(embedding_dim, ff_hidden_features, n_attn_heads) for _ in range(n_decoder_blocks)])
+        # self._layer_norm_1 = LayerNorm(embedding_dim)
+        self._pos_encoding = PositionalEncoding()
+        self._n_attn_heads = n_attn_heads
+        self._transformer = nn.Transformer(
+            embedding_dim,
+            n_attn_heads,
+            n_encoder_blocks,
+            n_decoder_blocks,
+            ff_hidden_features,
+            dropout=0,
+            batch_first=True,
+            norm_first=True,
+        )
+
+    def _get_masks(self, mask_type: str, src_tokens: Optional[Tensor] = None, tgt_tokens: Optional[Tensor] = None):
+        """Calculate the mask to be feeded into the self attention calculation.
+        'mask_type': type of mask
+        'src_tokens': tensor of shape (B, seq_token),
+        'tgt_tokens": tensor of shape (B, tgt_token),
+        Returns:
+            mask: shape (B, seq_len, seq_len) that can be applied to the attention module.
+        """
+        ignore_token_ids = [self._embedding_padding_idx]
+        if mask_type == "src_mask":
+            assert src_tokens is not None and tgt_tokens is None
+            mask = get_mask_from_token(src_tokens, ignore_token_ids)
+            mask_v = mask[:, None, :]  # B, 1, seq_len
+            mask_h = mask[:, :, None]  # B, seq_len, 1
+            mask = mask_v * mask_h  # B, seq_len, seq_len
+        elif mask_type == "tgt_src_mask":
+            assert tgt_tokens is not None and src_tokens is not None
+            mask_tgt = get_mask_from_token(tgt_tokens, ignore_token_ids)[:, :, None]  # B, len_tgt, 1
+            mask_src = get_mask_from_token(src_tokens, ignore_token_ids)[:, None, :]  # B, 1, len_src
+            mask = mask_tgt * mask_src
+        elif mask_type == "tgt_mask":
+            assert tgt_tokens is not None and src_tokens is None
+            mask = get_mask_from_token(tgt_tokens, ignore_token_ids)
+            mask_v = mask[:, None, :]  # B, 1, seq_len
+            mask_h = mask[:, :, None]  # B, seq_len, 1
+            mask = mask_v * mask_h  # B, seq_len, seq_len
+            mask &= torch.tril(mask)
+        else:
+            raise ValueError(f"Invalid mask_type={mask_type} given!")
+
+        return mask
+
+
+    def forward(self, input: Dict):
+        """input is a dictionary containing the following keys:
+        'source': batched input containing tokenized source language sentences stored as padded list of integers, shape (B, seq_len)
+        'target': (Optional) batched input containing tokenized target language sentences stored as padded list of integers, shape (B, seq_len)
+            in the inference time, target should be None, since the model will use it's own output at time t to condition its prediction at time t+1
+        Note both source and target tensor have the same shape, because they share a joint vocabulary and also the embedding layer.
+
+        The output is a tensor of shape (B, seq_len, dictionary_len) containing the probability distribution of the next token at each time step.
+        """
+
+        if self.training:
+            src, tgt = input['source'], input['target']
+            del input
+
+            # in training time, we shift the target tensor by one time step to the right
+            # and pad the first token with 0, which is the start of sequence token
+            tgt = torch.cat([torch.zeros_like(tgt[:, 0:1]), tgt[:, :-1]], dim=-1)
+
+            # mask_src = self._get_masks("src_mask", src_tokens=src)
+            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1])), diagonal=1).to(tgt)
+            # mask_tgt_src = self._get_masks("tgt_src_mask", src_tokens=src, tgt_tokens=tgt)
+
+            rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
+            src = self._word_embedding(src) * rescale_factor
+            tgt = self._word_embedding(tgt) * rescale_factor
+
+            src = self._pos_encoding(src)
+            tgt = self._pos_encoding(tgt)
+
+            tgt_dec = self._transformer(src, tgt, tgt_mask=mask_tgt)  # torch uses true for ignored elements
+
+            tgt_dec = tgt_dec @ self._word_embedding.weight.T
+            # tgt_dec = torch.softmax(tgt_dec, dim=-1)
+
+            return tgt_dec
+
+        else:
+            src = input['source']
+            tgt = torch.zeros_like(src)
+            mask_tgt = torch.triu(torch.ones((tgt.shape[-1], tgt.shape[-1])), diagonal=1).to(tgt)
+            del input
+
+            rescale_factor = math.sqrt(self._embedding_dim)  # make it larger: we don't want the pe later to be louder than the words
+            src = self._word_embedding(src) * rescale_factor
+            src = self._pos_encoding(src)
+            del src
+
+            tgt[:, 0] = self._embedding_padding_idx
+            for i in range(tgt.shape[1]):
+                tgt_dec = self._word_embedding(tgt) * rescale_factor
+                tgt_dec = self._pos_encoding(tgt_dec)
+                tgt_dec = self._transformer(src, tgt, tgt_mask=mask_tgt)
+                tgt_dec = tgt_dec @ self._word_embedding.weight.T
+                # tgt_dec = torch.softmax(tgt_dec, dim=-1)
+                next_tokens = tgt_dec[:, i, :].argmax(dim=-1)  # shape: (B,)
+                if i != tgt.shape[1] - 1:
+                    tgt[:, i+1] = next_tokens
+
+            return tgt_dec
+
+
 class Transformer(nn.Module):
 
     def __init__(
